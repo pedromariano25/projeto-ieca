@@ -1,0 +1,125 @@
+// --- DEFINIÇÃO DOS PINOS ---
+const int PINO_VERDE = 6;     // Led "Viagem Segura"
+const int PINO_VERMELHO = 7;  // Led "Dormindo"
+const int PINO_BUZZER = 8;    // Buzzer
+
+// --- CONFIGURAÇÃO DE LÓGICA (MUITO IMPORTANTE) ---
+// Se o LED ficar aceso quando devia apagar, INVERTA estas duas linhas:
+const int LIGADO = LOW;      // Use LOW se for módulo de relé ou LED invertido
+const int DESLIGADO = HIGH;  // Use HIGH para apagar
+
+// --- CONFIGURAÇÃO DE TEMPOS ---
+const unsigned long TEMPO_TOLERANCIA = 3000; // 3 segundos de aviso antes do apito forte
+const int FREQ_GRAVE = 150;  // Som de aviso
+const int FREQ_AGUDA = 1000; // Som de perigo
+
+// --- VARIÁVEIS DE SISTEMA ---
+unsigned long tempoInicioAlarme = 0;
+bool emAlarme = false;
+char comando = '0'; // Começa assumindo estado seguro (0)
+
+void setup() {
+  Serial.begin(9600); // Comunicação com o Python
+  
+  pinMode(PINO_VERDE, OUTPUT);
+  pinMode(PINO_VERMELHO, OUTPUT);
+  pinMode(PINO_BUZZER, OUTPUT);
+
+  // --- ESTADO INICIAL (PREPARAÇÃO) ---
+  // Garante que tudo começa desligado
+  digitalWrite(PINO_VERDE, DESLIGADO);
+  digitalWrite(PINO_VERMELHO, DESLIGADO);
+  noTone(PINO_BUZZER);
+
+  // Limpa qualquer lixo na porta serial
+  while(Serial.available() > 0) {
+    Serial.read();
+  }
+
+  // Liga o Verde para começar (Viagem Segura)
+  digitalWrite(PINO_VERDE, LIGADO);
+}
+
+void loop() {
+  // 1. RECEBE COMANDO DO PYTHON
+  if (Serial.available() > 0) {
+    char leitura = Serial.read();
+    // Filtro de segurança: Só aceita 0 ou 1
+    if (leitura == '0' || leitura == '1') {
+      comando = leitura;
+    }
+  }
+
+  // 2. EXECUTA A LÓGICA
+  if (comando == '1') {
+    // >>> MODO SONO DETECTADO <<<
+    
+    // Se acabou de entrar nesse modo, inicia o cronômetro
+    if (!emAlarme) {
+      tempoInicioAlarme = millis(); 
+      emAlarme = true;
+    }
+    
+    // Troca os LEDs (Apaga Verde, Liga Vermelho)
+    digitalWrite(PINO_VERDE, DESLIGADO);
+    digitalWrite(PINO_VERMELHO, LIGADO);
+
+    // Verifica há quanto tempo está dormindo
+    unsigned long duracao = millis() - tempoInicioAlarme;
+
+    if (duracao < TEMPO_TOLERANCIA) {
+      tocarBipAviso(); // Fase 1: Aviso sonoro leve
+    } else {
+      tocarBipCritico(); // Fase 2: Alarme real
+    }
+
+  } else {
+    // >>> MODO VIAGEM SEGURA <<<
+    emAlarme = false;
+    
+    // Reseta tudo para o normal
+    digitalWrite(PINO_VERMELHO, DESLIGADO); // Apaga Vermelho
+    noTone(PINO_BUZZER);                    // Para o som
+    digitalWrite(PINO_VERDE, LIGADO);       // Liga Verde
+  }
+}
+
+// --- FUNÇÕES AUXILIARES DE SOM ---
+
+void tocarBipAviso() {
+  // Bip curto e grave
+  tone(PINO_BUZZER, FREQ_GRAVE);
+  delay(100);
+  noTone(PINO_BUZZER);
+  
+  // Espera verificando se acordou (para parar rápido)
+  for(int i=0; i<5; i++) { 
+    delay(100); 
+    if(verificarSeAcordou()) return; 
+  }
+}
+
+void tocarBipCritico() {
+  // Bip rápido e agudo
+  tone(PINO_BUZZER, FREQ_AGUDA);
+  delay(50);
+  noTone(PINO_BUZZER);
+  
+  // Espera curta
+  for(int i=0; i<2; i++) { 
+    delay(50); 
+    if(verificarSeAcordou()) return; 
+  }
+}
+
+// Função que lê a serial no meio do som para interromper o barulho instantaneamente
+bool verificarSeAcordou() {
+  if (Serial.available() > 0) {
+    char c = Serial.peek(); // Espia o próximo caractere sem limpar
+    if (c == '0') {
+      comando = '0'; // Força o estado para seguro
+      return true;   // Avisa para parar o som
+    }
+  }
+  return false;
+}
