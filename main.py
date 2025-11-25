@@ -1,408 +1,356 @@
 import os
-import socket
-import logging
-import threading
 import time
-from datetime import datetime
-import firebase_admin
-from firebase_admin import credentials, db
+import threading
+import logging
 import argparse
-# import imutils # REMOVIDO: imutils.resize é substituído por cv2.resize
+from collections import deque
+from datetime import datetime
+
 import cv2
-# import dlib # REMOVIDO: Dlib não é mais necessário
 import numpy as np
-# from imutils import face_utils # REMOVIDO: face_utils não é mais necessário
-from imutils.video import VideoStream
+import mediapipe as mp
+import serial
+import serial.tools.list_ports # --- NOVO: Para listar portas disponíveis
 from scipy.spatial import distance as dist
 from flask import Flask
+import firebase_admin
+from firebase_admin import credentials, db
 
-# --- NOVO: IMPORTS DO MEDIAPIPE ---
-import mediapipe as mp
+# --- CONFIGURAÇÕES DO SISTEMA ---
+LIMIAR_EAR = 0.21            # Ponto de corte (Olho Fechado)
+QTD_CONSEC_FRAMES_OLHOS = 45 # Tolerância (~2 segundos)
+LIMIAR_MAR = 0.60            # Boca (Bocejo)
+PORTA_ARDUINO = 'COM5'       # <--- SUA PORTA PADRÃO (Atualizada para COM5)
+SKIP_FRAME_RATE = 2          # Otimização de FPS (Processa a cada 2 frames)
 
-# --- NOVO: Constantes de Índices do MediaPipe ---
-# Mapeamento dos 6 pontos do Dlib para os 468 do MediaPipe
-MP_LEFT_EYE_INDICES = [33, 160, 158, 133, 153, 144]
-MP_RIGHT_EYE_INDICES = [362, 385, 387, 263, 373, 380]
-# Pontos para o cálculo do MAR (Top, Bottom, Left, Right)
-MP_MOUTH_INNER_INDICES = [13, 14, 78, 308]
-# Pontos para desenhar o contorno da boca (opcional, mas mais bonito)
-MP_MOUTH_OUTLINE_INDICES = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146]
+# --- CORES (INTERFACE CYBERPUNK) ---
+C_CYAN   = (255, 255, 0)
+C_VERDE  = (0, 255, 100)
+C_AMARELO= (0, 200, 255)
+C_LARANJA= (0, 100, 255)
+C_VERM   = (0, 0, 255)
+C_BRANCO = (240, 240, 240)
+C_DARK   = (15, 15, 15)
 
+# --- SETUP MEDIAPIPE (PONTOS DO ROSTO) ---
+MP_LEFT_EYE = [33, 160, 158, 133, 153, 144]
+MP_RIGHT_EYE = [362, 385, 387, 263, 373, 380]
+MP_MOUTH = [13, 14, 78, 308]
+MP_NOSE = 1
+MP_FACE_LEFT = 234
+MP_FACE_RIGHT = 454
 
-# --- CONFIGURAÇÃO DO FLASK ---
+# --- FLASK (SERVIDOR LOCAL) ---
 app = Flask(__name__)
-_status_lock = threading.Lock()
-_status_fadiga = "Iniciando..."
 log = logging.getLogger('werkzeug')
 log.setLevel(logging.ERROR)
+_status_lock = threading.Lock()
+_status_fadiga = "BOOTING..."
 
 @app.route('/status')
 def get_status():
-    with _status_lock:
-        return _status_fadiga
+    with _status_lock: return _status_fadiga
 
-def get_local_ip():
-    # ... (função get_local_ip original, sem mudanças) ...
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect(('10.255.255.255', 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = '127.0.0.1'
-    finally:
-        s.close()
-    return IP
+def rodar_flask():
+    try: app.run(host='0.0.0.0', port=5000, debug=False, use_reloader=False, threaded=True)
+    except: pass
 
-def rodar_servidor_flask(host='0.0.0.0', port=5000):
-    ip_local = get_local_ip()
-    print("[INFO] Servidor Flask rodando! Acesse no seu App Inventor:")
-    print(f"[INFO] ==> http://{ip_local}:{port}/status")
-    app.run(host=host, port=port, debug=False, use_reloader=False, threaded=True)
+# --- FUNÇÕES VISUAIS (HUD) ---
+def draw_tech_bracket(img, x, y, w, h, cor, thickness=2, length=20):
+    # Desenha cantoneiras tecnológicas
+    # Top Left
+    cv2.line(img, (x, y), (x + length, y), cor, thickness)
+    cv2.line(img, (x, y), (x, y + length), cor, thickness)
+    # Top Right
+    cv2.line(img, (x + w, y), (x + w - length, y), cor, thickness)
+    cv2.line(img, (x + w, y), (x + w, y + length), cor, thickness)
+    # Bottom Left
+    cv2.line(img, (x, y + h), (x + length, y + h), cor, thickness)
+    cv2.line(img, (x, y + h), (x, y + h - length), cor, thickness)
+    # Bottom Right
+    cv2.line(img, (x + w, y + h), (x + w - length, y + h), cor, thickness)
+    cv2.line(img, (x + w, y + h), (x + w, y + h - length), cor, thickness)
 
-# --- FUNÇÕES DE ASPECT RATIO ---
+def draw_panel(img, x, y, w, h, alpha=0.7):
+    # Fundo translúcido
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x, y), (x + w, y + h), C_DARK, -1)
+    cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+    # Borda sutil
+    draw_tech_bracket(img, x, y, w, h, C_CYAN, 1, 10)
+
+def draw_bar(img, x, y, w, h, pct, color):
+    # Barra de progresso
+    cv2.rectangle(img, (x, y), (x + w, y + h), (40, 40, 40), -1)
+    fill = int(w * (pct / 100.0))
+    fill = max(0, min(fill, w))
+    cv2.rectangle(img, (x, y), (x + fill, y + h), color, -1)
+    
 def calcular_ear(olho):
-    # --- ESTA FUNÇÃO É 100% REUTILIZADA ---
-    # O MediaPipe vai nos dar os 6 pontos exatos que o Dlib dava.
+    # Cálculo da razão de aspecto do olho (Eye Aspect Ratio)
     A = dist.euclidean(olho[1], olho[5])
     B = dist.euclidean(olho[2], olho[4])
     C = dist.euclidean(olho[0], olho[3])
-    ear = (A + B) / (2.0 * C) if C != 0 else 0.0
-    return ear
+    return (A + B) / (2.0 * C) if C != 0 else 0.0
 
-# --- REMOVIDO: calcular_mar(boca) ---
-# A função original do Dlib (8 pontos) não é mais usada.
-# O cálculo será feito inline com 4 pontos do MediaPipe.
+def verificar_pose(landmarks, w, h):
+    # Verifica se o motorista está olhando para os lados
+    nose = landmarks[MP_NOSE]
+    left = landmarks[MP_FACE_LEFT]
+    right = landmarks[MP_FACE_RIGHT]
+    dl = dist.euclidean((nose.x, nose.y), (left.x, left.y))
+    dr = dist.euclidean((nose.x, nose.y), (right.x, right.y))
+    if dr == 0: dr = 0.001
+    ratio = dl / dr
+    if ratio < 0.35 or ratio > 2.8: return "VIRADO"
+    return "FRENTE"
 
-# --- ARGPARSE ---
+# --- MAIN ---
 ap = argparse.ArgumentParser()
-ap.add_argument("-w", "--webcam", type=int, default=0, help="índice da webcam no sistema")
-# --- REMOVIDO: --shape-predictor ---
-# ap.add_argument("-p", "--shape-predictor", ...)
-ap.add_argument("--no-display", action="store_true", help="não abrir janela (útil em servidor headless)")
+ap.add_argument("-w", "--webcam", type=int, default=0)
+ap.add_argument("--no-display", action="store_true")
 args = vars(ap.parse_args())
 
-# --- REMOVIDO: Lógica de verificação do predictor ---
-# ... (toda a lógica de 'predictor_path' foi removida) ...
-
-
-# --- CONFIGURAÇÃO DO FIREBASE ---
-ref_firebase = None
+# Conexões Externas (Firebase)
 try:
-    # ... (lógica do Firebase original, sem mudanças) ...
     cred = credentials.Certificate('serviceAccountKey.json')
-    firebase_admin.initialize_app(cred, {
-        'databaseURL': 'https://safetruck-2f0a3-default-rtdb.firebaseio.com/'
-    })
-    ref_firebase = db.reference('status_caminhoneiro')
-    print("[INFO] Conectado ao Firebase Realtime Database.")
-except Exception as e:
-    print(f"[ERRO] Não foi possível conectar ao Firebase: {e}")
-    print("[WARN] Verifique se o 'serviceAccountKey.json' está na pasta correta.")
-    print("[WARN] O script continuará sem a integração com Firebase.")
+    firebase_admin.initialize_app(cred, {'databaseURL': 'https://safetruck-2f0a3-default-rtdb.firebaseio.com/'})
+    ref_fb = db.reference('status_caminhoneiro')
+except: ref_fb = None
 
-
-# --- CONSTANTES ---
-LIMIAR_EAR = 0.25 # Mantenha por enquanto, mas talvez precise de ajuste
-QTD_CONSEC_FRAMES_OLHOS = 20
-# --- ATENÇÃO AQUI ---
-LIMIAR_MAR = 0.4 # VALOR CHUTADO! O original (0.6) NÃO VAI FUNCIONAR.
-# --- VOCÊ PRECISA AJUSTAR ESSE VALOR ---
-QTD_CONSEC_FRAMES_BOCA = 15
-LARGURA_FRAME = 700
-
-# --- ESTADO ---
-# ... (lógica de estado original, sem mudanças) ...
-_contadores_lock = threading.Lock()
-CONTADOR_OLHOS = 0
-CONTADOR_BOCA = 0
-TOTAL_BOCEJOS = 0
-ALARME_ON = False
-PONTOS_FADIGA = 0.0
-
-# --- NOVO: Inicializa MediaPipe ---
-print("[INFO] Carregando MediaPipe Face Mesh...")
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    max_num_faces=1,                # Detecta apenas 1 rosto (igual ao Dlib)
-    refine_landmarks=True,          # Importante: Habilita os 468 pontos (íris, lábios)
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
-mp_drawing = mp.solutions.drawing_utils # Para desenhar (opcional)
-drawing_spec = mp_drawing.DrawingSpec(thickness=1, circle_radius=1)
-
-
-# --- REMOVIDO: Inicializa dlib ---
-# detector = dlib.get_frontal_face_detector()
-# preditor = dlib.shape_predictor(predictor_path)
-# (inicio_esq, fim_esq) = ...
-# (inicio_dir, fim_dir) = ...
-# (inicio_boca, fim_boca) = ...
-
-# Inicia thread de vídeo
-print("[INFO] Iniciando fluxo de vídeo...")
-# ... (lógica de inicialização da câmera original, sem mudanças) ...
-vs = None
+# Conexão Arduino (Serial) com DIAGNÓSTICO MELHORADO
+arduino = None
 try:
-    vs = VideoStream(src=args["webcam"]).start()
-    time.sleep(1.0)
-    frame_test = vs.read()
-    if frame_test is None:
-        raise Exception("VideoStream não retornou frame.")
-except Exception as e:
-    print(f"[WARN] VideoStream falhou ({e}), tentando cv2.VideoCapture fallback...")
-    cap = cv2.VideoCapture(args["webcam"])
-    if not cap.isOpened():
-        raise SystemExit("[ERRO] Não foi possível abrir a câmera. Cheque o índice/permissões.")
-    class CapWrapper:
-        def __init__(self, cap):
-            self.cap = cap
-        def read(self):
-            ret, frame = self.cap.read()
-            return frame if ret else None
-        def stop(self):
-            self.cap.release()
-    vs = CapWrapper(cap)
+    arduino = serial.Serial(PORTA_ARDUINO, 9600, timeout=0.1)
+    time.sleep(2) # Espera Arduino reiniciar após conexão
+    print(f"[HW] Arduino CONECTADO na porta: {PORTA_ARDUINO}")
+except Exception as e: 
+    print(f"\n[ERRO] Não consegui conectar na {PORTA_ARDUINO}.")
+    print(f"[DETALHE] {e}")
+    print("\n--- LISTA DE PORTAS DISPONÍVEIS ---")
+    # Lista todas as portas para ajudar você a achar a certa
+    ports = serial.tools.list_ports.comports()
+    if not ports:
+        print(" > Nenhuma porta COM encontrada (Verifique o cabo USB!)")
+    for port in ports:
+        print(f" > {port.device}: {port.description}")
+    print("-----------------------------------\n")
+    print("[DICA] Se o Arduino apareceu em outra porta (ex: COM3), mude a linha 'PORTA_ARDUINO' no código.\n")
 
+# Inicialização IA (MediaPipe)
+mp_face = mp.solutions.face_mesh.FaceMesh(max_num_faces=1, refine_landmarks=True)
+ear_queue = deque(maxlen=5)
+mar_queue = deque(maxlen=5)
+_lock = threading.Lock()
 
-# Inicia servidor Flask em thread
-# ... (lógica do Flask original, sem mudanças) ...
-print("[INFO] Iniciando thread do servidor Flask...")
-server_thread = threading.Thread(target=rodar_servidor_flask, daemon=True)
-server_thread.start()
+# Variáveis de Estado
+CONT_OLHOS, CONT_BOCA, BOCEJOS = 0, 0, 0
+ALARME, PONTOS = False, 0.0
+frame_count = 0
+scanner_line = 0
+fps_start = time.time()
+fps_val = 0
 
-# --- FUNÇÃO FIREBASE ---
-_last_data_sent_time = 0
-_firebase_update_interval = 1.0 # Envia 1x por segundo
+# Variáveis "Cache" (Para desenhar nos frames que a IA pula)
+last_pose = "---"
+last_ear = 0.0
+last_points = [] 
 
-def enviar_dados_firebase(data):
-    # ... (lógica do Firebase original, sem mudanças) ...
-    global ref_firebase
-    if not ref_firebase:
-        return
-    try:
-        ref_firebase.set(data)
-    except Exception as e:
-        print(f"[WARN] Falha ao enviar dados para Firebase (thread): {e}")
+# Inicia Flask em background
+threading.Thread(target=rodar_flask, daemon=True).start()
 
-
-# Configuração da janela
-NOME_JANELA = "Detector de Fadiga (MediaPipe)"
-# ... (lógica da janela, sem mudanças) ...
+# Configuração de Janela e Câmera
+NOME_JANELA = "SAFETRUCK v4.0 PRO"
 if not args.get("no_display"):
-    try:
-        cv2.namedWindow(NOME_JANELA, cv2.WINDOW_NORMAL)
-    except Exception:
-        print("[WARN] Não foi possível criar janela (ambiente headless?). Use --no-display para rodar sem GUI.")
+    cv2.namedWindow(NOME_JANELA, cv2.WINDOW_NORMAL)
+    cv2.setWindowProperty(NOME_JANELA, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+    cap = cv2.VideoCapture(args["webcam"])
+    # Tenta forçar resolução HD
+    cap.set(3, 1280)
+    cap.set(4, 720)
+else:
+    cap = cv2.VideoCapture(args["webcam"])
 
+_last_fb = 0
 
-# --- Loop principal ---
 try:
     while True:
-        frame = vs.read()
-        if frame is None:
-            print("[AVISO] Não foi possível ler o frame da câmera. Tentando novamente...")
-            time.sleep(0.5)
-            continue
-
-        # frame = imutils.resize(frame, width=LARGURA_FRAME) # Substituído
-        frame = cv2.resize(frame, (LARGURA_FRAME, int(LARGURA_FRAME * frame.shape[0] / frame.shape[1])))
+        ret, frame = cap.read()
+        if not ret: continue
         
-        # --- NOVO: LÓGICA MEDIAPIPE ---
-        # 1. Converte BGR (OpenCV) para RGB (MediaPipe)
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        # 2. Processa a imagem
-        results = face_mesh.process(rgb_frame)
-
-        texto_status_display = ""
-        cor_status_display = (0, 255, 0)
+        # Otimização visual e espelhamento
+        frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape
         
-        ear_frame = 0.0
-        mar_frame = 0.0
+        # --- OTIMIZAÇÃO: FRAME SKIPPING ---
+        # Só roda a IA pesada a cada X frames
+        frame_count += 1
+        run_detection = (frame_count % SKIP_FRAME_RATE == 0)
         
-        # 3. Verifica se um rosto foi detectado
-        if not results.multi_face_landmarks:
-            # --- LÓGICA "SEM ROSTO" (original, sem mudanças) ---
-            with _contadores_lock:
-                PONTOS_FADIGA = max(0.0, globals().get("PONTOS_FADIGA", 0.0) - 1.0)
-                CONTADOR_OLHOS = 0
-                CONTADOR_BOCA = 0
-                ALARME_ON = False
-            texto_status_display = "SEM ROSTO"
-            with _status_lock:
-                _status_fadiga = "Sem Rosto"
-            cor_status_display = (100, 100, 100)
-        else:
-            # --- ROSTO DETECTADO ---
-            # Pega o primeiro (e único) rosto
-            face_landmarks = results.multi_face_landmarks[0]
-            all_landmarks = face_landmarks.landmark
-            
-            # Pega as dimensões do frame para desnormalizar os pontos
-            h, w, _ = frame.shape
-
-            # --- NOVO: Extração de pontos para EAR ---
-            # Constrói o array NumPy exatamente como o Dlib fazia,
-            # mas usando os índices do MediaPipe.
-            olho_esq_pts = np.array(
-                [(all_landmarks[i].x * w, all_landmarks[i].y * h) for i in MP_LEFT_EYE_INDICES],
-                dtype=np.int32
-            )
-            olho_dir_pts = np.array(
-                [(all_landmarks[i].x * w, all_landmarks[i].y * h) for i in MP_RIGHT_EYE_INDICES],
-                dtype=np.int32
-            )
-            
-            # Calcula o EAR (a função 'calcular_ear' é a MESMA de antes)
-            ear = (calcular_ear(olho_esq_pts) + calcular_ear(olho_dir_pts)) / 2.0
-
-            # --- NOVO: Extração de pontos e cálculo do MAR ---
-            # [13] = Lábio superior (centro)
-            # [14] = Lábio inferior (centro)
-            # [78] = Canto da boca (esquerda)
-            # [308] = Canto da boca (direita)
-            top_lip = all_landmarks[MP_MOUTH_INNER_INDICES[0]]
-            bot_lip = all_landmarks[MP_MOUTH_INNER_INDICES[1]]
-            l_lip = all_landmarks[MP_MOUTH_INNER_INDICES[2]]
-            r_lip = all_landmarks[MP_MOUTH_INNER_INDICES[3]]
-
-            # Calcula distâncias (usando coordenadas normalizadas, é mais rápido)
-            dist_vertical = dist.euclidean((top_lip.x, top_lip.y), (bot_lip.x, bot_lip.y))
-            dist_horizontal = dist.euclidean((l_lip.x, l_lip.y), (r_lip.x, r_lip.y))
-            
-            mar = dist_vertical / dist_horizontal if dist_horizontal != 0 else 0.0
-            
-            # Salva EAR/MAR do frame
-            ear_frame = ear
-            mar_frame = mar
-
-            # --- NOVO: Desenho (Melhorado) ---
-            # Desenha os contornos dos olhos (igual antes, mas com pontos do MP)
-            cv2.drawContours(frame, [cv2.convexHull(olho_esq_pts)], -1, (0, 255, 0), 1)
-            cv2.drawContours(frame, [cv2.convexHull(olho_dir_pts)], -1, (0, 255, 0), 1)
-            
-            # Desenha o contorno da boca (opcional)
-            boca_desenho_pts = np.array(
-                [(all_landmarks[i].x * w, all_landmarks[i].y * h) for i in MP_MOUTH_OUTLINE_INDICES],
-                dtype=np.int32
-            )
-            cv2.drawContours(frame, [cv2.convexHull(boca_desenho_pts)], -1, (0, 255, 0), 1)
-
-
-            # --- LÓGICA DE FADIGA (original, sem mudanças) ---
-            # Esta é a sua "business logic". Ela não muda.
-            # Ela apenas reage aos valores de 'ear' e 'mar'.
-            with _contadores_lock:
-                if mar > LIMIAR_MAR: # <-- LEMBRE-SE DE AJUSTAR O LIMIAR
-                    CONTADOR_BOCA += 1
-                else:
-                    if CONTADOR_BOCA >= QTD_CONSEC_FRAMES_BOCA:
-                        PONTOS_FADIGA = min(100.0, PONTOS_FADIGA + 15.0)
-                        TOTAL_BOCEJOS += 1
-                    CONTADOR_BOCA = 0
-
-                if ear < LIMIAR_EAR: # <-- TALVEZ PRECISE DE AJUSTE
-                    CONTADOR_OLHOS += 1
-                    PONTOS_FADIGA = min(100.0, PONTOS_FADIGA + 1.0)
-                    if CONTADOR_OLHOS >= QTD_CONSEC_FRAMES_OLHOS:
-                        if not ALARME_ON:
-                            ALARME_ON = True
-                        PONTOS_FADIGA = 100.0
-                else:
-                    CONTADOR_OLHOS = 0
-                    ALARME_ON = False
-                    PONTOS_FADIGA = max(0.0, PONTOS_FADIGA - 0.5)
-
-                PONTOS_FADIGA = max(0.0, min(100.0, PONTOS_FADIGA))
-
-                if ALARME_ON:
-                    status = "ALERTA CRITICO"
-                    texto_status_display = "[ALERTA] SONOLENCIA!"
-                    cor_status_display = (0, 0, 255)
-                elif PONTOS_FADIGA > 70:
-                    status = "FADIGA ALTA"
-                    texto_status_display = "FADIGA ALTA"
-                    cor_status_display = (0, 165, 255)
-                elif PONTOS_FADIGA > 40:
-                    status = "FADIGA MODERADA"
-                    texto_status_display = "FADIGA MODERADA"
-                    cor_status_display = (0, 255, 255)
-                elif CONTADOR_BOCA > 1:
-                    status = "BOCEJANDO"
-                    texto_status_display = "BOCEJANDO"
-                    cor_status_display = (255, 255, 0)
-                else:
-                    status = "NORMAL"
-                    texto_status_display = "NORMAL"
-                    cor_status_display = (0, 255, 0)
-
-                with _status_lock:
-                    _status_fadiga = status
-
-            # ... (lógica cv2.putText original, sem mudanças) ...
-            cv2.putText(frame, texto_status_display, (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, cor_status_display, 2)
-            cv2.putText(frame, f"Bocejos: {TOTAL_BOCEJOS}", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-            cv2.putText(frame, f"MAR: {mar:.2f}", (500, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-            cv2.putText(frame, f"EAR: {ear:.2f}", (500, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-            texto_fadiga = f"NIVEL FADIGA: {PONTOS_FADIGA:.0f}%"
-            cv2.putText(frame, texto_fadiga, (10, 90),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if PONTOS_FADIGA<=40 else (0,165,255) if PONTOS_FADIGA<=70 else (0,0,255), 2)
-
+        # Texto Padrão
+        txt_main = "SISTEMA ATIVO"
+        sub_txt = "MONITORANDO BIOMETRIA"
+        cor_tema = C_CYAN
         
-        # --- LÓGICA DE ATUALIZAÇÃO FIREBASE (original, sem mudanças) ---
-        agora = time.time()
-        if ref_firebase and (agora - _last_data_sent_time > _firebase_update_interval):
-            _last_data_sent_time = agora
+        if run_detection:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            res = mp_face.process(rgb)
             
-            with _contadores_lock:
-                current_pontos = PONTOS_FADIGA
-                current_bocejos = TOTAL_BOCEJOS
-                current_alarme = ALARME_ON
-            with _status_lock:
-                current_status = _status_fadiga
+            if res.multi_face_landmarks:
+                lm = res.multi_face_landmarks[0].landmark
+                np_lm = lambda i: np.array([lm[i].x*w, lm[i].y*h], dtype=int)
+                
+                # Atualiza Cache
+                last_pose = verificar_pose(lm, w, h)
+                
+                oe = np.array([np_lm(i) for i in MP_LEFT_EYE])
+                od = np.array([np_lm(i) for i in MP_RIGHT_EYE])
+                boca = np.array([np_lm(i) for i in MP_MOUTH])
+                
+                # Salva pontos para desenhar depois
+                last_points = [oe, od]
+                
+                ear_now = (calcular_ear(oe) + calcular_ear(od)) / 2.0
+                mar_now = dist.euclidean(boca[0], boca[1]) / (dist.euclidean(boca[2], boca[3]) + 0.001)
+                
+                ear_queue.append(ear_now)
+                mar_queue.append(mar_now)
+                
+                # Usa a média suavizada (mais estável)
+                ear = sum(ear_queue)/len(ear_queue)
+                mar = sum(mar_queue)/len(mar_queue)
+                last_ear = ear 
 
-            data_to_send = {
-                'timestamp': datetime.now().isoformat(),
-                'status': current_status,
-                'pontos_fadiga': round(current_pontos, 2),
-                'total_bocejos': current_bocejos,
-                'ear_atual': round(ear_frame, 2), # ear_frame e mar_frame agora são 0.0 se sem rosto
-                'mar_atual': round(mar_frame, 2),
-                'alarme_on': current_alarme
-            }
+                with _lock:
+                    if last_pose == "VIRADO":
+                        txt_main = "ATENCAO"
+                        sub_txt = "ROSTO VIRADO"
+                        cor_tema = C_AMARELO
+                        CONT_OLHOS = 0
+                    else:
+                        # Detecção de Bocejo
+                        if mar > LIMIAR_MAR: CONT_BOCA += 1
+                        else:
+                            if CONT_BOCA > 15: 
+                                PONTOS = min(100, PONTOS + 15)
+                                BOCEJOS += 1
+                            CONT_BOCA = 0
+                        
+                        # Detecção de Olhos Fechados
+                        if ear < LIMIAR_EAR:
+                            CONT_OLHOS += SKIP_FRAME_RATE # Compensa os frames pulados
+                            PONTOS = min(100, PONTOS + 0.5)
+                            if CONT_OLHOS >= QTD_CONSEC_FRAMES_OLHOS:
+                                ALARME = True
+                                PONTOS = 100
+                        else:
+                            CONT_OLHOS = 0
+                            ALARME = False
+                            PONTOS = max(0, PONTOS - 0.5)
+        
+        # --- DESENHO DA INTERFACE (RODA EM TODO FRAME) ---
+        with _lock:
+            if ALARME:
+                txt_main = "PERIGO IMINENTE"
+                sub_txt = "CONDUTOR DORMINDO"
+                cor_tema = C_VERM
+            elif PONTOS > 50:
+                txt_main = "FADIGA ALTA"
+                sub_txt = "RECOMENDA-SE PARADA"
+                cor_tema = C_LARANJA
+            elif last_pose == "VIRADO":
+                txt_main = "DISTRACAO"
+                sub_txt = "OLHE PARA FRENTE"
+                cor_tema = C_AMARELO
             
-            threading.Thread(target=enviar_dados_firebase, args=(data_to_send,), daemon=True).start()
+            _status_fadiga = txt_main
 
+        # Desenha os olhos e miras
+        if len(last_points) > 0:
+            cv2.polylines(frame, [cv2.convexHull(last_points[0])], True, cor_tema, 2, cv2.LINE_AA)
+            cv2.polylines(frame, [cv2.convexHull(last_points[1])], True, cor_tema, 2, cv2.LINE_AA)
+            # Crosshair
+            cx_l = int(np.mean(last_points[0], axis=0)[0])
+            cy_l = int(np.mean(last_points[0], axis=0)[1])
+            cx_r = int(np.mean(last_points[1], axis=0)[0])
+            cy_r = int(np.mean(last_points[1], axis=0)[1])
+            l = 10
+            cv2.line(frame, (cx_l-l, cy_l), (cx_l+l, cy_l), cor_tema, 1)
+            cv2.line(frame, (cx_l, cy_l-l), (cx_l, cy_l+l), cor_tema, 1)
+            cv2.line(frame, (cx_r-l, cy_r), (cx_r+l, cy_r), cor_tema, 1)
+            cv2.line(frame, (cx_r, cy_r-l), (cx_r, cy_r+l), cor_tema, 1)
 
-        # mostra janela se não estiver em headless
+        # Efeito Scanner (Linha que desce)
+        scanner_line += 10
+        if scanner_line > h: scanner_line = 0
+        line_color = C_VERM if ALARME else (0, 100, 0)
+        cv2.line(frame, (0, scanner_line), (w, scanner_line), line_color, 1 if not ALARME else 4)
+
+        # --- COMUNICAÇÃO COM ARDUINO ---
+        # Envia '1' se ALARME for True, '0' se for False
+        if arduino and frame_count % 5 == 0: # Limita envio para não travar Serial
+            try: arduino.write(b'1' if ALARME else b'0')
+            except: pass
+
+        # --- HUD (ELEMENTOS GRAFICOS) ---
         if not args.get("no_display"):
-            try:
-                cv2.imshow(NOME_JANELA, frame)
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord("q"):
-                    break
-            except Exception:
-                pass
-except KeyboardInterrupt:
-    print("[INFO] Interrompido pelo usuário.")
+            
+            # Borda Vermelha de Pânico
+            if ALARME:
+                cv2.rectangle(frame, (0,0), (w,h), C_VERM, 30)
+
+            # 1. Painel Esquerdo (Métricas)
+            draw_panel(frame, 30, 30, 300, 300)
+            
+            cv2.putText(frame, "STATUS DO MOTORISTA", (45, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, C_BRANCO, 1, cv2.LINE_AA)
+            cv2.line(frame, (45, 70), (315, 70), cor_tema, 2)
+            
+            draw_bar(frame, 45, 100, 270, 15, PONTOS, cor_tema)
+            cv2.putText(frame, f"NIVEL FADIGA: {int(PONTOS)}%", (45, 95), cv2.FONT_HERSHEY_SIMPLEX, 0.4, C_BRANCO, 1, cv2.LINE_AA)
+            
+            cv2.putText(frame, f"EAR (Olhos): {last_ear:.3f}", (45, 150), cv2.FONT_HERSHEY_SIMPLEX, 0.5, C_CYAN, 1, cv2.LINE_AA)
+            cv2.putText(frame, f"Timer Sono: {CONT_OLHOS}/{QTD_CONSEC_FRAMES_OLHOS}", (45, 175), cv2.FONT_HERSHEY_SIMPLEX, 0.5, C_CYAN, 1, cv2.LINE_AA)
+            cv2.putText(frame, f"Bocejos: {BOCEJOS}", (45, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.5, C_BRANCO, 1, cv2.LINE_AA)
+            cv2.putText(frame, f"Pose: {last_pose}", (45, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.5, C_AMARELO if last_pose == "VIRADO" else C_VERDE, 1, cv2.LINE_AA)
+
+            # 2. Painel Central (Status)
+            cw = 500
+            cx = (w // 2) - (cw // 2)
+            draw_panel(frame, cx, 30, cw, 100)
+            
+            t1_sz = cv2.getTextSize(txt_main, cv2.FONT_HERSHEY_DUPLEX, 1.0, 2)[0]
+            t2_sz = cv2.getTextSize(sub_txt, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 1)[0]
+            
+            cv2.putText(frame, txt_main, (cx + (cw-t1_sz[0])//2, 80), cv2.FONT_HERSHEY_DUPLEX, 1.0, cor_tema, 2, cv2.LINE_AA)
+            cv2.putText(frame, sub_txt, (cx + (cw-t2_sz[0])//2, 110), cv2.FONT_HERSHEY_SIMPLEX, 0.6, C_BRANCO, 1, cv2.LINE_AA)
+
+            # 3. Rodapé (FPS + Hardware)
+            draw_panel(frame, 30, h-70, w-60, 40)
+            
+            if frame_count % 10 == 0:
+                fps_val = 10 / (time.time() - fps_start)
+                fps_start = time.time()
+            
+            hora = datetime.now().strftime("%H:%M:%S")
+            hw_txt = "ARDUINO ONLINE" if arduino else "ARDUINO OFFLINE"
+            hw_col = C_VERDE if arduino else (100,100,100)
+
+            cv2.putText(frame, f"FPS: {int(fps_val)}", (50, h-45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, C_CYAN, 1)
+            cv2.putText(frame, f"TIME: {hora}", (200, h-45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, C_BRANCO, 1)
+            cv2.putText(frame, hw_txt, (w-250, h-45), cv2.FONT_HERSHEY_SIMPLEX, 0.6, hw_col, 1)
+
+            cv2.imshow(NOME_JANELA, frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+        # Envio Firebase (Limitado a 1x por seg)
+        if ref_fb and (time.time() - _last_fb > 1.0):
+            _last_fb = time.time()
+            dt = {'status': txt_main, 'pontos': round(PONTOS,2), 'alarme': ALARME}
+            threading.Thread(target=lambda: ref_fb.set(dt), daemon=True).start()
+
+except KeyboardInterrupt: pass
 finally:
-    # --- LÓGICA DE FINALIZAÇÃO (original, sem mudanças) ---
-    print("[INFO] Finalizando...")
-    try:
-        cv2.destroyAllWindows()
-    except Exception:
-        pass
-    try:
-        vs.stop()
-    except Exception:
-        pass
-    
-    # --- NOVO: Limpa o MediaPipe ---
-    try:
-        face_mesh.close()
-    except Exception:
-        pass
+    cv2.destroyAllWindows()
+    cap.release()
+    if arduino: arduino.close()
+    print("\n[INFO] Sistema encerrado.")
